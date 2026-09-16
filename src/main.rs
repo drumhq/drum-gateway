@@ -39,6 +39,7 @@ struct GatewayConfig {
     relay_upstream_http: String,
     blossom_hostname: String,
     blossom_upstream_http: String,
+    blossom_max_write_bytes: i64,
 }
 
 impl GatewayConfig {
@@ -61,6 +62,7 @@ impl GatewayConfig {
             blossom_hostname: env::var("BLOSSOM_HOSTNAME")
                 .unwrap_or_else(|_| "blossom.drum.dev".to_string()),
             blossom_upstream_http: required_env("BLOSSOM_UPSTREAM_HTTP")?,
+            blossom_max_write_bytes: positive_i64_env("BLOSSOM_MAX_WRITE_BYTES", "95000000")?,
         })
     }
 }
@@ -73,13 +75,78 @@ struct AuthorizationRequest<'a> {
     public_key: Option<&'a str>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthorizationResponse {
     authorized: bool,
+    account_identity_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordNotePublicationRequest<'a> {
+    public_key: &'a str,
+    event_id: &'a str,
+}
+
+enum NotePublicationError {
+    LimitReached,
+    Unavailable,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReserveUploadRequest<'a> {
+    account_identity_id: &'a str,
+    requested_bytes: i64,
+    sha256: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReserveUploadResponse {
+    reservation_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitUploadRequest<'a> {
+    sha256: &'a str,
+    size_bytes: i64,
+    mime_type: &'a str,
+    public_url: &'a str,
+    uploaded_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseOwnerRequest<'a> {
+    account_identity_id: &'a str,
+    sha256: &'a str,
+}
+
+#[derive(Deserialize)]
+struct BlobDescriptor {
+    sha256: String,
+    size: i64,
+    #[serde(rename = "type")]
+    mime_type: String,
+    url: String,
+    uploaded: i64,
+}
+
+enum ReserveError {
+    LimitReached,
+    Unavailable,
 }
 
 impl GatewayState {
-    async fn authorize(&self, service: &str, action: &str, pubkey: Option<&str>) -> bool {
+    async fn authorize(
+        &self,
+        service: &str,
+        action: &str,
+        pubkey: Option<&str>,
+    ) -> AuthorizationResponse {
         let request = self
             .client
             .post(format!(
@@ -100,16 +167,156 @@ impl GatewayState {
             Ok(response) if response.status().is_success() => response
                 .json::<AuthorizationResponse>()
                 .await
-                .map(|response| response.authorized)
-                .unwrap_or(false),
+                .unwrap_or_else(|_| AuthorizationResponse::denied()),
             Ok(response) => {
                 tracing::warn!(status = %response.status(), service, action, "authorization API rejected request");
-                false
+                AuthorizationResponse::denied()
             }
             Err(error) => {
                 tracing::warn!(%error, service, action, "authorization API unavailable");
-                false
+                AuthorizationResponse::denied()
             }
+        }
+    }
+
+    async fn record_note_publication(
+        &self,
+        public_key: &str,
+        event_id: &str,
+    ) -> Result<(), NotePublicationError> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/internal/nostr/note-publications",
+                self.config.api_origin
+            ))
+            .bearer_auth(&self.config.shared_secret)
+            .json(&RecordNotePublicationRequest {
+                public_key,
+                event_id,
+            })
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| NotePublicationError::Unavailable)?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(NotePublicationError::LimitReached);
+        }
+        if !response.status().is_success() {
+            return Err(NotePublicationError::Unavailable);
+        }
+        Ok(())
+    }
+
+    async fn reserve_blossom_upload(
+        &self,
+        account_identity_id: &str,
+        requested_bytes: i64,
+        sha256: Option<&str>,
+    ) -> Result<ReserveUploadResponse, ReserveError> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/internal/blossom/reservations",
+                self.config.api_origin
+            ))
+            .bearer_auth(&self.config.shared_secret)
+            .json(&ReserveUploadRequest {
+                account_identity_id,
+                requested_bytes,
+                sha256,
+            })
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| ReserveError::Unavailable)?;
+        if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(ReserveError::LimitReached);
+        }
+        if !response.status().is_success() {
+            return Err(ReserveError::Unavailable);
+        }
+        response.json().await.map_err(|_| ReserveError::Unavailable)
+    }
+
+    async fn commit_blossom_upload(
+        &self,
+        reservation_id: &str,
+        descriptor: &BlobDescriptor,
+    ) -> bool {
+        self.retry_internal_request(|| {
+            self.client
+                .post(format!(
+                    "{}/v1/internal/blossom/reservations/{reservation_id}/commit",
+                    self.config.api_origin
+                ))
+                .bearer_auth(&self.config.shared_secret)
+                .json(&CommitUploadRequest {
+                    sha256: &descriptor.sha256,
+                    size_bytes: descriptor.size,
+                    mime_type: &descriptor.mime_type,
+                    public_url: &descriptor.url,
+                    uploaded_at: descriptor.uploaded,
+                })
+        })
+        .await
+    }
+
+    async fn cancel_blossom_reservation(&self, reservation_id: &str) {
+        let _ = self
+            .client
+            .delete(format!(
+                "{}/v1/internal/blossom/reservations/{reservation_id}",
+                self.config.api_origin
+            ))
+            .bearer_auth(&self.config.shared_secret)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+    }
+
+    async fn release_blossom_owner(&self, account_identity_id: &str, sha256: &str) -> bool {
+        self.retry_internal_request(|| {
+            self.client
+                .post(format!(
+                    "{}/v1/internal/blossom/owners/release",
+                    self.config.api_origin
+                ))
+                .bearer_auth(&self.config.shared_secret)
+                .json(&ReleaseOwnerRequest {
+                    account_identity_id,
+                    sha256,
+                })
+        })
+        .await
+    }
+
+    async fn retry_internal_request<F>(&self, make_request: F) -> bool
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        for attempt in 0..3 {
+            if make_request()
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                return true;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+            }
+        }
+        false
+    }
+}
+
+impl AuthorizationResponse {
+    fn denied() -> Self {
+        Self {
+            authorized: false,
+            account_identity_id: None,
         }
     }
 }
@@ -169,7 +376,29 @@ async fn relay_request(state: GatewayState, request: Request) -> Response {
         };
     }
 
+    if is_relay_information_request(&request) {
+        return proxy_relay_information(request, &state.config.relay_upstream_http, &state.client)
+            .await;
+    }
+
     proxy_http(request, &state.config.relay_upstream_http, &state.client).await
+}
+
+fn is_relay_information_request(request: &Request) -> bool {
+    request.method() == Method::GET
+        && request.uri().path() == "/"
+        && request
+            .headers()
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.split(',').any(|media_type| {
+                    media_type
+                        .split(';')
+                        .next()
+                        .is_some_and(|value| value.trim() == "application/nostr+json")
+                })
+            })
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -202,6 +431,10 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
         return;
     }
 
+    let public_read = state
+        .authorize(RELAY_SERVICE, "read", None)
+        .await
+        .authorized;
     let mut authenticated_pubkey: Option<String> = None;
     loop {
         tokio::select! {
@@ -224,7 +457,7 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
                                 let _ = send_relay_ok(&mut client_socket, "", false, "auth-required: invalid NIP-42 event").await;
                                 continue;
                             };
-                            if state.authorize(RELAY_SERVICE, "read", Some(&pubkey)).await {
+                            if state.authorize(RELAY_SERVICE, "read", Some(&pubkey)).await.authorized {
                                 authenticated_pubkey = Some(pubkey);
                                 let _ = send_relay_ok(&mut client_socket, &event_id, true, "").await;
                             } else {
@@ -233,15 +466,23 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
                             continue;
                         }
 
-                        let Some(authenticated) = authenticated_pubkey.as_deref() else {
+                        if !can_attempt_relay_command(
+                            command,
+                            public_read,
+                            authenticated_pubkey.is_some(),
+                        ) {
                             let _ = client_socket.send(Message::Text(
-                                json!(["NOTICE", "auth-required: authenticate with NIP-42"])
-                                    .to_string().into()
+                                auth_required_response(command, value.as_ref())
+                                    .to_string()
+                                    .into(),
                             )).await;
                             continue;
-                        };
+                        }
 
                         if command == Some("EVENT") {
+                            let Some(authenticated) = authenticated_pubkey.as_deref() else {
+                                continue;
+                            };
                             let event_value = value.as_ref()
                                 .and_then(Value::as_array)
                                 .and_then(|items| items.get(1));
@@ -250,9 +491,22 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
                                 event.verify().is_ok() && event.pubkey.to_hex() == authenticated
                             });
                             let event_id = event.as_ref().map(|event| event.id.to_hex()).unwrap_or_default();
-                            if !valid || !state.authorize(RELAY_SERVICE, "write", Some(authenticated)).await {
+                            if !valid || !state.authorize(RELAY_SERVICE, "write", Some(authenticated)).await.authorized {
                                 let _ = send_relay_ok(&mut client_socket, &event_id, false, "restricted: event author is not approved").await;
                                 continue;
+                            }
+                            if event.as_ref().is_some_and(|event| event.kind.as_u16() == 1) {
+                                match state.record_note_publication(authenticated, &event_id).await {
+                                    Ok(()) => {}
+                                    Err(NotePublicationError::LimitReached) => {
+                                        let _ = send_relay_ok(&mut client_socket, &event_id, false, "rate-limited: publishing temporarily unavailable").await;
+                                        continue;
+                                    }
+                                    Err(NotePublicationError::Unavailable) => {
+                                        let _ = send_relay_ok(&mut client_socket, &event_id, false, "error: publishing temporarily unavailable").await;
+                                        continue;
+                                    }
+                                }
                             }
                         }
 
@@ -333,30 +587,220 @@ fn has_json_tag(tags: &[Value], name: &str, expected: &str) -> bool {
     })
 }
 
+fn can_attempt_relay_command(
+    command: Option<&str>,
+    public_read: bool,
+    authenticated: bool,
+) -> bool {
+    if command == Some("EVENT") {
+        authenticated
+    } else {
+        public_read || authenticated
+    }
+}
+
+fn auth_required_response(command: Option<&str>, value: Option<&Value>) -> Value {
+    if command == Some("EVENT") {
+        let event_id = value
+            .and_then(Value::as_array)
+            .and_then(|items| items.get(1))
+            .and_then(|event| event.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        json!([
+            "OK",
+            event_id,
+            false,
+            "auth-required: authenticate with NIP-42"
+        ])
+    } else {
+        json!(["NOTICE", "auth-required: authenticate with NIP-42"])
+    }
+}
+
 async fn blossom_request(state: GatewayState, request: Request) -> Response {
     let write = !matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
     );
-    let public_key = if write {
+    let authorization = if write {
         match blossom_authorization_pubkey(request.headers()) {
-            Ok(public_key) => Some(public_key),
+            Ok(authorization) => Some(authorization),
             Err(message) => return (StatusCode::UNAUTHORIZED, message).into_response(),
         }
     } else {
         None
     };
     let action = if write { "write" } else { "read" };
-    if !state
-        .authorize(BLOSSOM_SERVICE, action, public_key.as_deref())
-        .await
-    {
+    let decision = state
+        .authorize(
+            BLOSSOM_SERVICE,
+            action,
+            authorization
+                .as_ref()
+                .map(|authorization| authorization.public_key.as_str()),
+        )
+        .await;
+    if !decision.authorized {
         return (StatusCode::FORBIDDEN, "Nostr public key is not approved").into_response();
     }
-    proxy_http(request, &state.config.blossom_upstream_http, &state.client).await
+
+    let path = request.uri().path().to_string();
+    let is_upload = request.method().as_str() == "PUT" && path == "/upload";
+    let is_mirror = request.method().as_str() == "PUT" && path == "/mirror";
+    let delete_hash = (request.method().as_str() == "DELETE")
+        .then(|| blossom_hash_from_path(&path))
+        .flatten();
+
+    if is_upload || is_mirror {
+        let Some(account_identity_id) = decision.account_identity_id.as_deref() else {
+            return (
+                StatusCode::FORBIDDEN,
+                "Nostr identity is not linked to an account",
+            )
+                .into_response();
+        };
+        let requested_bytes = if is_upload {
+            let Some(length) = request
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|length| *length >= 0)
+            else {
+                return (StatusCode::LENGTH_REQUIRED, "Content-Length is required").into_response();
+            };
+            length
+        } else {
+            state.config.blossom_max_write_bytes
+        };
+        let expected_hash = request
+            .headers()
+            .get("x-sha-256")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| valid_sha256(value))
+            .or_else(|| {
+                authorization
+                    .as_ref()
+                    .and_then(|authorization| authorization.hashes.first().map(String::as_str))
+            });
+        let reservation = match state
+            .reserve_blossom_upload(account_identity_id, requested_bytes, expected_hash)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(ReserveError::LimitReached) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Account Blossom storage limit reached",
+                )
+                    .into_response();
+            }
+            Err(ReserveError::Unavailable) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Storage accounting unavailable",
+                )
+                    .into_response();
+            }
+        };
+        let upstream =
+            match send_http(request, &state.config.blossom_upstream_http, &state.client).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(%error, "Blossom upstream request failed");
+                    state
+                        .cancel_blossom_reservation(&reservation.reservation_id)
+                        .await;
+                    return (StatusCode::BAD_GATEWAY, "service temporarily unavailable")
+                        .into_response();
+                }
+            };
+        let buffered = match buffer_upstream_response(upstream).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%error, "Blossom upstream response failed");
+                state
+                    .cancel_blossom_reservation(&reservation.reservation_id)
+                    .await;
+                return (StatusCode::BAD_GATEWAY, "service temporarily unavailable")
+                    .into_response();
+            }
+        };
+        if !buffered.status.is_success() {
+            state
+                .cancel_blossom_reservation(&reservation.reservation_id)
+                .await;
+            return buffered.into_response();
+        }
+        let descriptor = match serde_json::from_slice::<BlobDescriptor>(&buffered.body) {
+            Ok(descriptor)
+                if valid_blob_descriptor(&descriptor) && descriptor.size <= requested_bytes =>
+            {
+                descriptor
+            }
+            _ => {
+                state
+                    .cancel_blossom_reservation(&reservation.reservation_id)
+                    .await;
+                return (StatusCode::BAD_GATEWAY, "Invalid Blossom upload response")
+                    .into_response();
+            }
+        };
+        if !state
+            .commit_blossom_upload(&reservation.reservation_id, &descriptor)
+            .await
+        {
+            state
+                .cancel_blossom_reservation(&reservation.reservation_id)
+                .await;
+            tracing::error!(
+                reservation_id = %reservation.reservation_id,
+                sha256 = %descriptor.sha256,
+                "Blossom upload succeeded but accounting commit failed"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Storage accounting unavailable",
+            )
+                .into_response();
+        }
+        return buffered.into_response();
+    }
+
+    let upstream = match send_http(request, &state.config.blossom_upstream_http, &state.client)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, "upstream request failed");
+            return (StatusCode::BAD_GATEWAY, "service temporarily unavailable").into_response();
+        }
+    };
+    if upstream.status().is_success()
+        && let (Some(account_identity_id), Some(sha256)) = (
+            decision.account_identity_id.as_deref(),
+            delete_hash.as_deref(),
+        )
+        && !state
+            .release_blossom_owner(account_identity_id, sha256)
+            .await
+    {
+        tracing::error!(
+            account_identity_id,
+            sha256,
+            "Blossom delete accounting failed"
+        );
+    }
+    stream_upstream_response(upstream)
 }
 
-fn blossom_authorization_pubkey(headers: &HeaderMap) -> Result<String, &'static str> {
+struct BlossomAuthorization {
+    public_key: String,
+    hashes: Vec<String>,
+}
+
+fn blossom_authorization_pubkey(headers: &HeaderMap) -> Result<BlossomAuthorization, &'static str> {
     let encoded = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -375,25 +819,118 @@ fn blossom_authorization_pubkey(headers: &HeaderMap) -> Result<String, &'static 
     }
     let value: Value =
         serde_json::from_slice(&payload).map_err(|_| "invalid Blossom authorization event")?;
-    let expiration = value
+    let tags = value
         .get("tags")
         .and_then(Value::as_array)
-        .and_then(|tags| {
-            tags.iter().find_map(|tag| {
-                let items = tag.as_array()?;
-                (items.first()?.as_str()? == "expiration")
-                    .then(|| items.get(1)?.as_str()?.parse::<u64>().ok())
-                    .flatten()
-            })
+        .ok_or("missing Blossom authorization tags")?;
+    let expiration = tags
+        .iter()
+        .find_map(|tag| {
+            let items = tag.as_array()?;
+            (items.first()?.as_str()? == "expiration")
+                .then(|| items.get(1)?.as_str()?.parse::<u64>().ok())
+                .flatten()
         })
         .ok_or("missing Blossom authorization expiration")?;
     if expiration <= nostr::Timestamp::now().as_secs() {
         return Err("expired Blossom authorization");
     }
-    Ok(event.pubkey.to_hex())
+    let hashes = tags
+        .iter()
+        .filter_map(|tag| {
+            let items = tag.as_array()?;
+            let hash = items
+                .first()
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "x")
+                .then(|| items.get(1)?.as_str())??;
+            valid_sha256(hash).then(|| hash.to_string())
+        })
+        .collect();
+    Ok(BlossomAuthorization {
+        public_key: event.pubkey.to_hex(),
+        hashes,
+    })
 }
 
 async fn proxy_http(request: Request, upstream: &str, client: &reqwest::Client) -> Response {
+    match send_http(request, upstream, client).await {
+        Ok(response) => stream_upstream_response(response),
+        Err(error) => {
+            tracing::warn!(%error, "upstream request failed");
+            (StatusCode::BAD_GATEWAY, "service temporarily unavailable").into_response()
+        }
+    }
+}
+
+async fn proxy_relay_information(
+    request: Request,
+    upstream: &str,
+    client: &reqwest::Client,
+) -> Response {
+    let upstream = match send_http(request, upstream, client).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, "relay information request failed");
+            return (StatusCode::BAD_GATEWAY, "service temporarily unavailable").into_response();
+        }
+    };
+    let buffered = match buffer_upstream_response(upstream).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, "relay information response failed");
+            return (StatusCode::BAD_GATEWAY, "service temporarily unavailable").into_response();
+        }
+    };
+    if !buffered.status.is_success() {
+        return buffered.into_response();
+    }
+    let Some(body) = rewrite_relay_information(&buffered.body) else {
+        return buffered.into_response();
+    };
+    relay_information_response(buffered.status, &buffered.headers, body)
+}
+
+fn relay_information_response(status: StatusCode, headers: &HeaderMap, body: Vec<u8>) -> Response {
+    let content_length = body.len();
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    copy_response_headers(headers, response.headers_mut());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/nostr+json"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&content_length.to_string()).unwrap(),
+    );
+    response
+}
+
+fn rewrite_relay_information(body: &[u8]) -> Option<Vec<u8>> {
+    let mut information: Value = serde_json::from_slice(body).ok()?;
+    let object = information.as_object_mut()?;
+    let supported_nips = object
+        .entry("supported_nips")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()?;
+    if !supported_nips.iter().any(|nip| nip.as_u64() == Some(42)) {
+        supported_nips.push(Value::from(42));
+        supported_nips.sort_by_key(|nip| nip.as_u64().unwrap_or(u64::MAX));
+    }
+    let limitation = object
+        .entry("limitation")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()?;
+    limitation.insert("restricted_writes".to_string(), Value::Bool(true));
+    serde_json::to_vec(&information).ok()
+}
+
+async fn send_http(
+    request: Request,
+    upstream: &str,
+    client: &reqwest::Client,
+) -> Result<reqwest::Response, reqwest::Error> {
     let (parts, body) = request.into_parts();
     let path = parts
         .uri
@@ -402,21 +939,27 @@ async fn proxy_http(request: Request, upstream: &str, client: &reqwest::Client) 
         .unwrap_or("/");
     let url = format!("{}{}", upstream.trim_end_matches('/'), path);
     let method = Method::from_bytes(parts.method.as_str().as_bytes()).unwrap_or(Method::GET);
-    let mut builder = client
-        .request(method, url)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let forwards_body = method_forwards_body(&method);
+    let mut builder = client.request(method, url);
+    if forwards_body {
+        builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    }
     for (name, value) in &parts.headers {
-        if !is_hop_by_hop(name.as_str()) && name != header::HOST {
+        if !is_hop_by_hop(name.as_str())
+            && name != header::HOST
+            && (forwards_body || name != header::CONTENT_LENGTH)
+        {
             builder = builder.header(name, value);
         }
     }
-    let response = match builder.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(%error, "upstream request failed");
-            return (StatusCode::BAD_GATEWAY, "service temporarily unavailable").into_response();
-        }
-    };
+    builder.send().await
+}
+
+fn method_forwards_body(method: &Method) -> bool {
+    method != Method::GET && method != Method::HEAD
+}
+
+fn stream_upstream_response(response: reqwest::Response) -> Response {
     let status = response.status();
     let headers = response.headers().clone();
     let mut outgoing = Response::new(Body::from_stream(response.bytes_stream()));
@@ -429,6 +972,67 @@ async fn proxy_http(request: Request, upstream: &str, client: &reqwest::Client) 
         }
     }
     outgoing
+}
+
+struct BufferedUpstreamResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+impl BufferedUpstreamResponse {
+    fn into_response(self) -> Response {
+        let mut outgoing = Response::new(Body::from(self.body));
+        *outgoing.status_mut() = self.status;
+        copy_response_headers(&self.headers, outgoing.headers_mut());
+        outgoing
+    }
+}
+
+async fn buffer_upstream_response(
+    response: reqwest::Response,
+) -> Result<BufferedUpstreamResponse, reqwest::Error> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes().await?.to_vec();
+    Ok(BufferedUpstreamResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn copy_response_headers(source: &HeaderMap, destination: &mut HeaderMap) {
+    for (name, value) in source {
+        if !is_hop_by_hop(name.as_str()) {
+            destination.append(name, value.clone());
+        }
+    }
+}
+
+fn blossom_hash_from_path(path: &str) -> Option<String> {
+    let value = path.strip_prefix('/')?.split('.').next()?;
+    valid_sha256(value).then(|| value.to_string())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+}
+
+fn valid_blob_descriptor(descriptor: &BlobDescriptor) -> bool {
+    valid_sha256(&descriptor.sha256)
+        && descriptor.size >= 0
+        && descriptor.uploaded >= 0
+        && !descriptor.mime_type.trim().is_empty()
+        && descriptor.mime_type.len() <= 255
+        && descriptor.mime_type.contains('/')
+        && descriptor.url.len() <= 2_048
+        && reqwest::Url::parse(&descriptor.url)
+            .ok()
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -447,6 +1051,17 @@ fn is_hop_by_hop(name: &str) -> bool {
 
 fn required_env(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("{name} must be set"))
+}
+
+fn positive_i64_env(name: &str, default: &str) -> Result<i64> {
+    let value = env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<i64>()
+        .with_context(|| format!("{name} must be a valid i64"))?;
+    if value <= 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -469,5 +1084,124 @@ mod tests {
 
         assert!(verify_relay_auth(&value, challenge, relay).is_ok());
         assert!(verify_relay_auth(&value, "another", relay).is_err());
+    }
+
+    #[test]
+    fn public_clients_can_read_but_cannot_publish() {
+        assert!(can_attempt_relay_command(Some("REQ"), true, false));
+        assert!(can_attempt_relay_command(Some("CLOSE"), true, false));
+        assert!(!can_attempt_relay_command(Some("EVENT"), true, false));
+        assert!(can_attempt_relay_command(Some("EVENT"), true, true));
+        assert!(!can_attempt_relay_command(Some("REQ"), false, false));
+    }
+
+    #[test]
+    fn unauthenticated_event_gets_nip42_ok_rejection() {
+        let event_id = "a".repeat(64);
+        let message = json!(["EVENT", { "id": event_id }]);
+
+        assert_eq!(
+            auth_required_response(Some("EVENT"), Some(&message)),
+            json!([
+                "OK",
+                event_id,
+                false,
+                "auth-required: authenticate with NIP-42"
+            ])
+        );
+    }
+
+    #[test]
+    fn relay_information_advertises_nip42_and_restricted_writes() {
+        let rewritten = rewrite_relay_information(
+            br#"{"name":"Drum Relay","supported_nips":[1,11],"limitation":{"payment_required":false}}"#,
+        )
+        .unwrap();
+        let information: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(information["name"], "Drum Relay");
+        assert_eq!(information["supported_nips"], json!([1, 11, 42]));
+        assert_eq!(information["limitation"]["payment_required"], false);
+        assert_eq!(information["limitation"]["restricted_writes"], true);
+    }
+
+    #[test]
+    fn rewritten_relay_information_uses_its_new_content_length() {
+        let original = br#"{"supported_nips":[1]}"#;
+        let rewritten = rewrite_relay_information(original).unwrap();
+        let original_length = original.len().to_string();
+        let rewritten_length = rewritten.len().to_string();
+
+        assert_ne!(original_length, rewritten_length);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_str(&original_length).unwrap(),
+        );
+        let response = relay_information_response(StatusCode::OK, &headers, rewritten);
+
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            rewritten_length.as_str()
+        );
+    }
+
+    #[test]
+    fn bodyless_proxy_methods_do_not_forward_streaming_bodies() {
+        assert!(!method_forwards_body(&Method::GET));
+        assert!(!method_forwards_body(&Method::HEAD));
+        assert!(method_forwards_body(&Method::POST));
+        assert!(method_forwards_body(&Method::PUT));
+        assert!(method_forwards_body(&Method::DELETE));
+    }
+
+    #[test]
+    fn extracts_lowercase_hashes_from_paths() {
+        let hash = "a".repeat(64);
+        assert_eq!(blossom_hash_from_path(&format!("/{hash}.jpg")), Some(hash));
+        assert_eq!(blossom_hash_from_path("/not-a-hash"), None);
+    }
+
+    #[test]
+    fn verifies_blossom_authorization_and_extracts_hashes() {
+        let keys = Keys::generate();
+        let hash = "b".repeat(64);
+        let expiration = (nostr::Timestamp::now().as_secs() + 60).to_string();
+        let event = EventBuilder::new(Kind::Custom(BLOSSOM_AUTH_KIND), "Authorize upload")
+            .tags([
+                Tag::parse(["t", "upload"]).unwrap(),
+                Tag::parse(["expiration", expiration.as_str()]).unwrap(),
+                Tag::parse(["x", hash.as_str()]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let encoded = STANDARD.encode(serde_json::to_vec(&event).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Nostr {encoded}").parse().unwrap(),
+        );
+
+        let authorization = blossom_authorization_pubkey(&headers).unwrap();
+        assert_eq!(authorization.public_key, keys.public_key().to_hex());
+        assert_eq!(authorization.hashes, vec![hash]);
+    }
+
+    #[test]
+    fn validates_gallery_metadata_from_blob_descriptors() {
+        let descriptor = BlobDescriptor {
+            sha256: "d".repeat(64),
+            size: 42,
+            mime_type: "image/webp".to_string(),
+            url: format!("https://blossom.drum.dev/{}.webp", "d".repeat(64)),
+            uploaded: 1_700_000_000,
+        };
+        assert!(valid_blob_descriptor(&descriptor));
+
+        let invalid = BlobDescriptor {
+            url: "file:///tmp/blob.webp".to_string(),
+            ..descriptor
+        };
+        assert!(!valid_blob_descriptor(&invalid));
     }
 }

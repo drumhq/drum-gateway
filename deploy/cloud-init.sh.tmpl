@@ -1,0 +1,115 @@
+#!/bin/sh
+set -eu
+
+bootstrap_stage=initialization
+publish_bootstrap_error() {
+  status=$?
+  [ "$status" -eq 0 ] && return
+  install -d -m 0755 /var/lib/drum-diagnostics
+  printf '{"status":"failed","stage":"%s","exit_code":%s}\n' \
+    "$bootstrap_stage" "$status" > /var/lib/drum-diagnostics/status.json
+}
+trap publish_bootstrap_error EXIT
+
+export DEBIAN_FRONTEND=noninteractive
+bootstrap_stage=package_install
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates caddy curl ufw
+systemctl disable --now caddy
+
+bootstrap_stage=binary_install
+artifact_url=$(printf '%s' '__GATEWAY_ARTIFACT_URL_B64__' | base64 -d)
+expected_sha256=__GATEWAY_ARTIFACT_SHA256__
+curl --fail --location --retry 10 --retry-all-errors \
+  --output /tmp/drum-gateway "$artifact_url"
+printf '%s  %s\n' "$expected_sha256" /tmp/drum-gateway | sha256sum --check --status
+install -m 0755 -o root -g root /tmp/drum-gateway /usr/local/bin/drum-gateway
+rm -f /tmp/drum-gateway
+
+bootstrap_stage=configuration
+install -d -m 0750 /etc/drum
+{
+  printf 'GATEWAY_BIND_ADDR=127.0.0.1:3100\n'
+  printf 'DRUM_API_ORIGIN='
+  printf '%s' '__DRUM_API_ORIGIN_B64__' | base64 -d
+  printf '\nGATEWAY_SHARED_SECRET='
+  printf '%s' '__GATEWAY_SHARED_SECRET_B64__' | base64 -d
+  printf '\nRELAY_HOSTNAME=relay.drum.dev\n'
+  printf 'RELAY_PUBLIC_URL=wss://relay.drum.dev/\n'
+  printf 'RELAY_UPSTREAM_WS=ws://__RELAY_PRIVATE_IPV4__:8080\n'
+  printf 'RELAY_UPSTREAM_HTTP=http://__RELAY_PRIVATE_IPV4__:8080\n'
+  printf 'BLOSSOM_HOSTNAME=blossom.drum.dev\n'
+  printf 'BLOSSOM_UPSTREAM_HTTP=http://__BLOSSOM_PRIVATE_IPV4__:3000\n'
+  printf 'RUST_LOG=drum_gateway=info\n'
+} > /etc/drum/gateway.env
+chmod 0600 /etc/drum/gateway.env
+
+if ! getent passwd drum-gateway >/dev/null; then
+  useradd --system --no-create-home --home-dir /nonexistent \
+    --shell /usr/sbin/nologin drum-gateway
+fi
+
+cat > /etc/systemd/system/drum-gateway.service <<'EOF'
+[Unit]
+Description=Drum Nostr and Blossom authorization gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=drum-gateway
+Group=drum-gateway
+EnvironmentFile=/etc/drum/gateway.env
+ExecStart=/usr/local/bin/drum-gateway
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+bootstrap_stage=service_start
+systemctl daemon-reload
+systemctl enable --now drum-gateway
+
+bootstrap_stage=caddy_configuration
+cat > /etc/caddy/Caddyfile <<'EOF'
+relay.drum.dev, blossom.drum.dev {
+  reverse_proxy 127.0.0.1:3100
+}
+EOF
+caddy validate --config /etc/caddy/Caddyfile
+
+bootstrap_stage=firewall
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw --force enable
+
+bootstrap_stage=health_check
+for attempt in $(seq 1 30); do
+  if curl --fail --silent http://127.0.0.1:3100/health >/dev/null; then
+    touch /var/lib/drum-bootstrap-complete
+    break
+  fi
+  sleep 2
+done
+test -f /var/lib/drum-bootstrap-complete
+
+bootstrap_stage=edge_start
+systemctl enable --now caddy
+
+find /var/lib/cloud/instances -type f \( -name 'user-data.txt' -o -name 'user-data.txt.i' -o -path '*/scripts/part-*' \) -delete
+trap - EXIT

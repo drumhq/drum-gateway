@@ -7,11 +7,14 @@ and proxies approved traffic to private Vultr VPC origins.
 
 ## Enforcement
 
-- Relay WebSocket sessions require NIP-42 authentication.
+- Relay subscriptions are public; NIP-42 authentication is required before publishing.
 - Relay events must be valid, authored by the authenticated key, and have an
   active `shared-relay` write grant.
 - Blossom uploads, mirrors, and deletes require a valid kind `24242`
   authorization event and an active `shared-blossom` write grant.
+- Blossom uploads and mirrors reserve account storage before reaching the
+  upstream service, then commit the returned hash and size to account-level
+  usage. Deletes release ownership after the upstream accepts them.
 - Blossom downloads remain public so media works in ordinary Nostr clients.
 - Authorization fails closed when the Drum API is unavailable.
 
@@ -33,3 +36,24 @@ cargo fmt --check
 cargo check --all-targets
 cargo test
 ```
+
+## Shared gateway deployment
+
+Pushes to `main` run `.github/workflows/deploy-shared.yml`. The workflow tests
+the gateway and builds the release binary inside Debian Bookworm, matching the
+gateway operating system. It publishes the binary as a public, immutable,
+commit-specific GitHub prerelease, verifies the SHA-256 checksum on the VM, and
+installs the gateway as a hardened systemd service. Vultr user-data is removed
+after the deployment attempt.
+
+Configure these repository Actions secrets:
+
+- `VULTR_API_KEY`: the deployment API key.
+- `GATEWAY_SHARED_SECRET`: the Drum API machine-to-machine secret.
+
+Configure one repository Actions variable:
+
+- `DRUM_API_ORIGIN`: the Drum API used for authorization and accounting.
+
+The gateway receives the shared API secret and a public, commit-specific binary
+URL. It does not receive GitHub credentials.

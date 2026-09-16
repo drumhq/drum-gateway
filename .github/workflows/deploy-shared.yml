@@ -1,0 +1,150 @@
+name: Deploy shared gateway
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: shared-gateway
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify-build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+      GATEWAY_SHARED_SECRET: ${{ secrets.GATEWAY_SHARED_SECRET }}
+      VULTR_GATEWAY_ID: 9f12d5c5-a788-4dd9-b340-39d8fbbace44
+      DRUM_API_ORIGIN: ${{ vars.DRUM_API_ORIGIN }}
+      RELAY_PRIVATE_IPV4: 10.42.0.3
+      BLOSSOM_PRIVATE_IPV4: 10.42.0.4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify required deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(VULTR_API_KEY GATEWAY_SHARED_SECRET DRUM_API_ORIGIN)
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing repository Actions value: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Test and build Debian release binary
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/app" \
+            --workdir /app \
+            rust:1.90-bookworm \
+            sh -ceu '
+              apt-get update
+              apt-get install -y --no-install-recommends cmake
+              rustup component add rustfmt
+              cargo fmt --check
+              cargo check --all-targets --locked
+              cargo test --locked
+              cargo build --release --locked
+            '
+          sudo chown "$(id -u):$(id -g)" target/release/drum-gateway
+
+      - name: Publish immutable GitHub release artifact
+        id: artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_tag="gateway-$GITHUB_SHA"
+          artifact_sha256=$(sha256sum target/release/drum-gateway | awk '{print $1}')
+          install -m 0755 target/release/drum-gateway /tmp/drum-gateway-linux-amd64
+          printf '%s  %s\n' "$artifact_sha256" drum-gateway-linux-amd64 \
+            > /tmp/drum-gateway-linux-amd64.sha256
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$release_tag" \
+              /tmp/drum-gateway-linux-amd64 \
+              /tmp/drum-gateway-linux-amd64.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$release_tag" \
+              /tmp/drum-gateway-linux-amd64 \
+              /tmp/drum-gateway-linux-amd64.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Gateway $GITHUB_SHA" \
+              --notes "Automated shared gateway build for commit $GITHUB_SHA." \
+              --prerelease
+          fi
+          artifact_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$release_tag/drum-gateway-linux-amd64"
+          echo "sha256=$artifact_sha256" >> "$GITHUB_OUTPUT"
+          echo "url_b64=$(printf '%s' "$artifact_url" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+
+      - name: Build one-time gateway bootstrap
+        shell: bash
+        env:
+          ARTIFACT_URL_B64: ${{ steps.artifact.outputs.url_b64 }}
+          ARTIFACT_SHA256: ${{ steps.artifact.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          api_origin_b64=$(printf '%s' "$DRUM_API_ORIGIN" | base64 -w 0)
+          shared_secret_b64=$(printf '%s' "$GATEWAY_SHARED_SECRET" | base64 -w 0)
+          sed \
+            -e "s|__GATEWAY_ARTIFACT_URL_B64__|$ARTIFACT_URL_B64|g" \
+            -e "s|__GATEWAY_ARTIFACT_SHA256__|$ARTIFACT_SHA256|g" \
+            -e "s|__DRUM_API_ORIGIN_B64__|$api_origin_b64|g" \
+            -e "s|__GATEWAY_SHARED_SECRET_B64__|$shared_secret_b64|g" \
+            -e "s|__RELAY_PRIVATE_IPV4__|$RELAY_PRIVATE_IPV4|g" \
+            -e "s|__BLOSSOM_PRIVATE_IPV4__|$BLOSSOM_PRIVATE_IPV4|g" \
+            deploy/cloud-init.sh.tmpl > /tmp/gateway-cloud-init.sh
+          chmod 0600 /tmp/gateway-cloud-init.sh
+
+      - name: Reinstall gateway with systemd service
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n --rawfile data /tmp/gateway-cloud-init.sh \
+            '{user_data: ($data | @base64)}' |
+            curl --fail --silent --show-error --request PATCH \
+              "https://api.vultr.com/v2/instances/$VULTR_GATEWAY_ID" \
+              --header "Authorization: Bearer $VULTR_API_KEY" \
+              --header 'Content-Type: application/json' \
+              --data-binary @-
+          curl --fail --silent --show-error --request POST \
+            "https://api.vultr.com/v2/instances/$VULTR_GATEWAY_ID/reinstall" \
+            --header "Authorization: Bearer $VULTR_API_KEY"
+
+      - name: Verify public gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 120); do
+            response=$(curl --max-time 5 --silent --show-error \
+              --header 'Accept: application/nostr+json' \
+              https://relay.drum.dev/ 2>/dev/null || true)
+            if jq -e \
+              '((.supported_nips // []) | index(42)) != null and .limitation.restricted_writes == true' \
+              >/dev/null 2>&1 <<<"$response"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Gateway did not become healthy' >&2
+          exit 1
+
+      - name: Clear one-time user data
+        if: always()
+        run: |
+          printf '%s' '{"user_data":""}' |
+            curl --fail --silent --show-error --request PATCH \
+              "https://api.vultr.com/v2/instances/$VULTR_GATEWAY_ID" \
+              --header "Authorization: Bearer $VULTR_API_KEY" \
+              --header 'Content-Type: application/json' \
+              --data-binary @-
