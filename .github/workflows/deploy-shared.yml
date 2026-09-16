@@ -1,6 +1,9 @@
 name: Deploy shared gateway
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 concurrency:

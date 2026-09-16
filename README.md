@@ -69,7 +69,7 @@ secrets, and only runs when manually dispatched with `REBUILD`. Its recovery
 user-data is cleared after every attempt. Normal deployments never read these
 certificate secrets or modify Caddy.
 
-For an existing VM created before the updater was introduced, push these
-changes and run `Recover shared gateway` once. The normal deployment workflow
-is manual-only during this migration so pushing the recovery code cannot reboot
-or reinstall the VM. Automatic push deployments can be enabled after recovery.
+For an existing VM created before the updater was introduced, run
+`Recover shared gateway` once. After recovery, pushes to `main` use the normal
+reboot-and-update deployment path. The recovery workflow remains manual for
+disaster recovery.
