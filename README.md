@@ -62,14 +62,6 @@ The normal deployment workflow does not need `GATEWAY_SHARED_SECRET` or
 `DRUM_API_ORIGIN`; they remain in the VM's protected gateway environment file.
 The VM downloads public release assets and receives no GitHub credentials.
 
-The one-time `Recover shared gateway` workflow rebuilds an existing VM with a
-static Cloudflare Origin CA certificate. It requires the existing recovery
-values plus the `CLOUDFLARE_ORIGIN_CERT` and `CLOUDFLARE_ORIGIN_KEY` repository
-secrets, and only runs when manually dispatched with `REBUILD`. Its recovery
-user-data is cleared after every attempt. Normal deployments never read these
-certificate secrets or modify Caddy.
-
-For an existing VM created before the updater was introduced, push these
-changes and run `Recover shared gateway` once. The normal deployment workflow
-is manual-only during this migration so pushing the recovery code cannot reboot
-or reinstall the VM. Automatic push deployments can be enabled after recovery.
+The VM was bootstrapped with a static Cloudflare Origin CA certificate. Normal
+deployments never read the certificate secrets or modify Caddy. Pushes to
+`main` use the reboot-and-update deployment path and never reinstall the VM.

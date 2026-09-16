@@ -7,7 +7,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use futures_util::{SinkExt, StreamExt};
 use nostr::Event;
 use rand::RngCore;
@@ -66,7 +69,7 @@ impl GatewayConfig {
             blossom_hostname: env::var("BLOSSOM_HOSTNAME")
                 .unwrap_or_else(|_| "media.drum.dev".to_string()),
             blossom_upstream_http: required_env("BLOSSOM_UPSTREAM_HTTP")?,
-            blossom_max_write_bytes: positive_i64_env("BLOSSOM_MAX_WRITE_BYTES", "95000000")?,
+            blossom_max_write_bytes: positive_i64_env("BLOSSOM_MAX_WRITE_BYTES", "25000000")?,
         })
     }
 }
@@ -140,8 +143,19 @@ struct BlobDescriptor {
 }
 
 enum ReserveError {
-    LimitReached,
+    UploadLimitReached,
+    StorageLimitReached,
     Unavailable,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorResponse {
+    error: ApiErrorDetails,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorDetails {
+    code: String,
 }
 
 impl GatewayState {
@@ -235,7 +249,15 @@ impl GatewayState {
             .await
             .map_err(|_| ReserveError::Unavailable)?;
         if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            return Err(ReserveError::LimitReached);
+            let code = response
+                .json::<ApiErrorResponse>()
+                .await
+                .ok()
+                .map(|body| body.error.code);
+            return Err(match code.as_deref() {
+                Some("blossom_upload_limit_reached") => ReserveError::UploadLimitReached,
+                _ => ReserveError::StorageLimitReached,
+            });
         }
         if !response.status().is_success() {
             return Err(ReserveError::Unavailable);
@@ -667,19 +689,52 @@ fn auth_required_response() -> Value {
 }
 
 async fn blossom_request(state: GatewayState, request: Request) -> Response {
-    let write = !matches!(
-        *request.method(),
-        axum::http::Method::GET | axum::http::Method::HEAD
-    );
-    let authorization = if write {
-        match blossom_authorization_pubkey(request.headers()) {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let is_upload = method == Method::PUT && path == "/upload";
+    let is_upload_preflight = method == Method::HEAD && path == "/upload";
+    let is_mirror = method == Method::PUT && path == "/mirror";
+    let is_media = (method == Method::PUT || method == Method::HEAD) && path == "/media";
+    let delete_hash = (method == Method::DELETE)
+        .then(|| blossom_hash_from_path(&path))
+        .flatten();
+    let expected_action = if is_upload || is_upload_preflight || is_mirror {
+        Some("upload")
+    } else if delete_hash.is_some() {
+        Some("delete")
+    } else if is_media {
+        Some("media")
+    } else {
+        None
+    };
+    let header_hash = request
+        .headers()
+        .get("x-sha-256")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| valid_sha256(value));
+    let expected_hash = delete_hash.as_deref().or(header_hash);
+    let requires_hash = is_mirror || delete_hash.is_some() || is_media;
+    let write = method != Method::GET && method != Method::HEAD;
+    let requires_authorization = expected_action.is_some() || (write && path != "/report");
+    let authorization = if requires_authorization {
+        match blossom_authorization(
+            request.headers(),
+            expected_action,
+            &state.config.blossom_hostname,
+            expected_hash,
+            requires_hash,
+        ) {
             Ok(authorization) => Some(authorization),
             Err(message) => return (StatusCode::UNAUTHORIZED, message).into_response(),
         }
     } else {
         None
     };
-    let action = if write { "write" } else { "read" };
+    let action = if requires_authorization {
+        "write"
+    } else {
+        "read"
+    };
     let decision = state
         .authorize(
             BLOSSOM_SERVICE,
@@ -693,12 +748,35 @@ async fn blossom_request(state: GatewayState, request: Request) -> Response {
         return (StatusCode::FORBIDDEN, "Nostr public key is not approved").into_response();
     }
 
-    let path = request.uri().path().to_string();
-    let is_upload = request.method().as_str() == "PUT" && path == "/upload";
-    let is_mirror = request.method().as_str() == "PUT" && path == "/mirror";
-    let delete_hash = (request.method().as_str() == "DELETE")
-        .then(|| blossom_hash_from_path(&path))
-        .flatten();
+    if is_upload_preflight {
+        let Some(account_identity_id) = decision.account_identity_id.as_deref() else {
+            return (
+                StatusCode::FORBIDDEN,
+                "Nostr identity is not linked to an account",
+            )
+                .into_response();
+        };
+        let Some(requested_bytes) = request
+            .headers()
+            .get("x-content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|length| *length >= 0)
+        else {
+            return (StatusCode::LENGTH_REQUIRED, "X-Content-Length is required").into_response();
+        };
+        match state
+            .reserve_blossom_upload(account_identity_id, requested_bytes, header_hash)
+            .await
+        {
+            Ok(reservation) => {
+                state
+                    .cancel_blossom_reservation(&reservation.reservation_id)
+                    .await;
+            }
+            Err(error) => return blossom_reservation_error(error),
+        }
+    }
 
     if is_upload || is_mirror {
         let Some(account_identity_id) = decision.account_identity_id.as_deref() else {
@@ -737,20 +815,7 @@ async fn blossom_request(state: GatewayState, request: Request) -> Response {
             .await
         {
             Ok(reservation) => reservation,
-            Err(ReserveError::LimitReached) => {
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Account Blossom storage limit reached",
-                )
-                    .into_response();
-            }
-            Err(ReserveError::Unavailable) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Storage accounting unavailable",
-                )
-                    .into_response();
-            }
+            Err(error) => return blossom_reservation_error(error),
         };
         let upstream =
             match send_http(request, &state.config.blossom_upstream_http, &state.client).await {
@@ -843,20 +908,50 @@ async fn blossom_request(state: GatewayState, request: Request) -> Response {
     stream_upstream_response(upstream)
 }
 
+fn blossom_reservation_error(error: ReserveError) -> Response {
+    match error {
+        ReserveError::UploadLimitReached => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Upload exceeds the account plan's file-size limit",
+        )
+            .into_response(),
+        ReserveError::StorageLimitReached => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Account Blossom storage limit reached",
+        )
+            .into_response(),
+        ReserveError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Storage accounting unavailable",
+        )
+            .into_response(),
+    }
+}
+
 struct BlossomAuthorization {
     public_key: String,
     hashes: Vec<String>,
 }
 
-fn blossom_authorization_pubkey(headers: &HeaderMap) -> Result<BlossomAuthorization, &'static str> {
-    let encoded = headers
+fn blossom_authorization(
+    headers: &HeaderMap,
+    expected_action: Option<&str>,
+    expected_server: &str,
+    expected_hash: Option<&str>,
+    require_hash: bool,
+) -> Result<BlossomAuthorization, &'static str> {
+    let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Nostr "))
         .ok_or("missing Blossom Nostr authorization")?;
-    let payload = STANDARD
-        .decode(encoded)
-        .map_err(|_| "invalid Blossom authorization encoding")?;
+    let mut parts = authorization.split_whitespace();
+    let scheme = parts.next().ok_or("missing Blossom Nostr authorization")?;
+    let encoded = parts.next().ok_or("missing Blossom Nostr authorization")?;
+    if !scheme.eq_ignore_ascii_case("nostr") || parts.next().is_some() {
+        return Err("invalid Blossom authorization scheme");
+    }
+    let payload =
+        decode_blossom_authorization(encoded).ok_or("invalid Blossom authorization encoding")?;
     let event: Event =
         serde_json::from_slice(&payload).map_err(|_| "invalid Blossom authorization event")?;
     event
@@ -864,6 +959,10 @@ fn blossom_authorization_pubkey(headers: &HeaderMap) -> Result<BlossomAuthorizat
         .map_err(|_| "invalid Blossom authorization signature")?;
     if event.kind.as_u16() != BLOSSOM_AUTH_KIND {
         return Err("invalid Blossom authorization kind");
+    }
+    let now = nostr::Timestamp::now().as_secs();
+    if event.created_at.as_secs() > now.saturating_add(60) {
+        return Err("Blossom authorization was created too far in the future");
     }
     let value: Value =
         serde_json::from_slice(&payload).map_err(|_| "invalid Blossom authorization event")?;
@@ -880,8 +979,30 @@ fn blossom_authorization_pubkey(headers: &HeaderMap) -> Result<BlossomAuthorizat
                 .flatten()
         })
         .ok_or("missing Blossom authorization expiration")?;
-    if expiration <= nostr::Timestamp::now().as_secs() {
+    if expiration <= now {
         return Err("expired Blossom authorization");
+    }
+    let action = tags.iter().find_map(|tag| {
+        let items = tag.as_array()?;
+        (items.first()?.as_str()? == "t").then(|| items.get(1)?.as_str())?
+    });
+    let action = action.ok_or("missing Blossom authorization action")?;
+    if expected_action.is_some_and(|expected| action != expected) {
+        return Err("Blossom authorization action does not match request");
+    }
+    let servers: Vec<&str> = tags
+        .iter()
+        .filter_map(|tag| {
+            let items = tag.as_array()?;
+            (items.first()?.as_str()? == "server").then(|| items.get(1)?.as_str())?
+        })
+        .collect();
+    if !servers.is_empty()
+        && !servers
+            .iter()
+            .any(|server| blossom_server_matches(server, expected_server))
+    {
+        return Err("Blossom authorization server does not match request");
     }
     let hashes = tags
         .iter()
@@ -894,10 +1015,47 @@ fn blossom_authorization_pubkey(headers: &HeaderMap) -> Result<BlossomAuthorizat
                 .then(|| items.get(1)?.as_str())??;
             valid_sha256(hash).then(|| hash.to_string())
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if require_hash && hashes.is_empty() {
+        return Err("missing Blossom authorization hash");
+    }
+    if expected_hash
+        .is_some_and(|expected| !hashes.is_empty() && !hashes.iter().any(|hash| hash == expected))
+    {
+        return Err("Blossom authorization hash does not match request");
+    }
     Ok(BlossomAuthorization {
         public_key: event.pubkey.to_hex(),
         hashes,
+    })
+}
+
+fn decode_blossom_authorization(encoded: &str) -> Option<Vec<u8>> {
+    [&URL_SAFE_NO_PAD, &URL_SAFE, &STANDARD_NO_PAD, &STANDARD]
+        .into_iter()
+        .find_map(|engine| engine.decode(encoded).ok())
+}
+
+fn blossom_server_matches(server: &str, expected_server: &str) -> bool {
+    fn hostname(value: &str) -> Option<String> {
+        if value.contains("://") {
+            reqwest::Url::parse(value)
+                .ok()?
+                .host_str()
+                .map(str::to_owned)
+        } else {
+            value
+                .split('/')
+                .next()?
+                .split(':')
+                .next()
+                .map(str::to_owned)
+        }
+    }
+
+    hostname(server).is_some_and(|server_host| {
+        hostname(expected_server)
+            .is_some_and(|expected_host| server_host.eq_ignore_ascii_case(&expected_host))
     })
 }
 
@@ -1239,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn verifies_blossom_authorization_and_extracts_hashes() {
+    fn verifies_url_safe_blossom_authorization_and_request_bindings() {
         let keys = Keys::generate();
         let hash = "b".repeat(64);
         let expiration = (nostr::Timestamp::now().as_secs() + 60).to_string();
@@ -1248,8 +1406,57 @@ mod tests {
                 Tag::parse(["t", "upload"]).unwrap(),
                 Tag::parse(["expiration", expiration.as_str()]).unwrap(),
                 Tag::parse(["x", hash.as_str()]).unwrap(),
+                Tag::parse(["server", "https://media.drum.dev/upload"]).unwrap(),
             ])
             .sign_with_keys(&keys)
+            .unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&event).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("nostr {encoded}").parse().unwrap(),
+        );
+
+        let authorization = blossom_authorization(
+            &headers,
+            Some("upload"),
+            "media.drum.dev",
+            Some(&hash),
+            true,
+        )
+        .unwrap();
+        assert_eq!(authorization.public_key, keys.public_key().to_hex());
+        assert_eq!(authorization.hashes, vec![hash]);
+
+        assert!(
+            blossom_authorization(&headers, Some("delete"), "media.drum.dev", None, false,)
+                .is_err()
+        );
+        assert!(
+            blossom_authorization(&headers, Some("upload"), "another.example", None, false,)
+                .is_err()
+        );
+        assert!(
+            blossom_authorization(
+                &headers,
+                Some("upload"),
+                "media.drum.dev",
+                Some(&"c".repeat(64)),
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_standard_base64_blossom_authorization() {
+        let expiration = (nostr::Timestamp::now().as_secs() + 60).to_string();
+        let event = EventBuilder::new(Kind::Custom(BLOSSOM_AUTH_KIND), "Authorize upload")
+            .tags([
+                Tag::parse(["t", "upload"]).unwrap(),
+                Tag::parse(["expiration", expiration.as_str()]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
             .unwrap();
         let encoded = STANDARD.encode(serde_json::to_vec(&event).unwrap());
         let mut headers = HeaderMap::new();
@@ -1258,9 +1465,9 @@ mod tests {
             format!("Nostr {encoded}").parse().unwrap(),
         );
 
-        let authorization = blossom_authorization_pubkey(&headers).unwrap();
-        assert_eq!(authorization.public_key, keys.public_key().to_hex());
-        assert_eq!(authorization.hashes, vec![hash]);
+        assert!(
+            blossom_authorization(&headers, Some("upload"), "media.drum.dev", None, false,).is_ok()
+        );
     }
 
     #[test]
@@ -1269,7 +1476,7 @@ mod tests {
             sha256: "d".repeat(64),
             size: 42,
             mime_type: "image/webp".to_string(),
-            url: format!("https://media.drum.dev/{}.webp", "d".repeat(64)),
+            url: format!("https://cdn.drum.dev/{}.webp", "d".repeat(64)),
             uploaded: 1_700_000_000,
         };
         assert!(valid_blob_descriptor(&descriptor));
