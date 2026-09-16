@@ -1,8 +1,6 @@
 name: Deploy shared gateway
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -18,11 +16,7 @@ jobs:
     timeout-minutes: 25
     env:
       VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
-      GATEWAY_SHARED_SECRET: ${{ secrets.GATEWAY_SHARED_SECRET }}
       VULTR_GATEWAY_ID: 9f12d5c5-a788-4dd9-b340-39d8fbbace44
-      DRUM_API_ORIGIN: ${{ vars.DRUM_API_ORIGIN }}
-      RELAY_PRIVATE_IPV4: 10.42.0.3
-      BLOSSOM_PRIVATE_IPV4: 10.42.0.4
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          required=(VULTR_API_KEY GATEWAY_SHARED_SECRET DRUM_API_ORIGIN)
+          required=(VULTR_API_KEY)
           for name in "${required[@]}"; do
             if [[ -z "${!name:-}" ]]; then
               echo "Missing repository Actions value: $name" >&2
@@ -41,6 +35,7 @@ jobs:
       - name: Test and build Debian release binary
         run: |
           docker run --rm \
+            --env "DRUM_GATEWAY_BUILD_SHA=$GITHUB_SHA" \
             --volume "$GITHUB_WORKSPACE:/app" \
             --workdir /app \
             rust:1.90-bookworm \
@@ -85,56 +80,52 @@ jobs:
           fi
           artifact_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$release_tag/drum-gateway-linux-amd64"
           echo "sha256=$artifact_sha256" >> "$GITHUB_OUTPUT"
-          echo "url_b64=$(printf '%s' "$artifact_url" | base64 -w 0)" >> "$GITHUB_OUTPUT"
 
-      - name: Build one-time gateway bootstrap
+      - name: Publish shared deployment artifact
         shell: bash
         env:
-          ARTIFACT_URL_B64: ${{ steps.artifact.outputs.url_b64 }}
-          ARTIFACT_SHA256: ${{ steps.artifact.outputs.sha256 }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          api_origin_b64=$(printf '%s' "$DRUM_API_ORIGIN" | base64 -w 0)
-          shared_secret_b64=$(printf '%s' "$GATEWAY_SHARED_SECRET" | base64 -w 0)
-          sed \
-            -e "s|__GATEWAY_ARTIFACT_URL_B64__|$ARTIFACT_URL_B64|g" \
-            -e "s|__GATEWAY_ARTIFACT_SHA256__|$ARTIFACT_SHA256|g" \
-            -e "s|__DRUM_API_ORIGIN_B64__|$api_origin_b64|g" \
-            -e "s|__GATEWAY_SHARED_SECRET_B64__|$shared_secret_b64|g" \
-            -e "s|__RELAY_PRIVATE_IPV4__|$RELAY_PRIVATE_IPV4|g" \
-            -e "s|__BLOSSOM_PRIVATE_IPV4__|$BLOSSOM_PRIVATE_IPV4|g" \
-            deploy/cloud-init.sh.tmpl > /tmp/gateway-cloud-init.sh
-          chmod 0600 /tmp/gateway-cloud-init.sh
+          deployment_tag=gateway-shared
+          if gh release view "$deployment_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$deployment_tag" \
+              /tmp/drum-gateway-linux-amd64 \
+              /tmp/drum-gateway-linux-amd64.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$deployment_tag" \
+              /tmp/drum-gateway-linux-amd64 \
+              /tmp/drum-gateway-linux-amd64.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title 'Shared gateway deployment' \
+              --notes 'Stable deployment assets consumed once when the shared gateway boots.' \
+              --prerelease
+          fi
 
-      - name: Reinstall gateway with systemd service
+      - name: Reboot gateway into published release
         shell: bash
         run: |
           set -euo pipefail
-          jq -n --rawfile data /tmp/gateway-cloud-init.sh \
-            '{user_data: ($data | @base64)}' |
-            curl --fail --silent --show-error --retry 5 --retry-all-errors \
-              --request PATCH \
-              "https://api.vultr.com/v2/instances/$VULTR_GATEWAY_ID" \
-              --header "Authorization: Bearer $VULTR_API_KEY" \
-              --header 'Content-Type: application/json' \
-              --data-binary @-
-          reinstall_status=$(curl --silent --show-error \
-            --output /tmp/vultr-reinstall-response.json \
+          reboot_status=$(curl --silent --show-error \
+            --output /tmp/vultr-reboot-response.json \
             --write-out '%{http_code}' \
             --request POST \
-            "https://api.vultr.com/v2/instances/$VULTR_GATEWAY_ID/reinstall" \
+            "https://api.vultr.com/v2/instances/$VULTR_GATEWAY_ID/reboot" \
             --header "Authorization: Bearer $VULTR_API_KEY")
-          case "$reinstall_status" in
+          case "$reboot_status" in
             2??) ;;
             504)
-              echo 'Vultr timed out after accepting the reinstall; continuing to health verification.'
+              echo 'Vultr timed out after accepting the reboot; continuing to health verification.'
               ;;
             *)
-              echo "Vultr reinstall failed with HTTP $reinstall_status" >&2
+              echo "Vultr reboot failed with HTTP $reboot_status" >&2
               exit 1
               ;;
           esac
-          rm -f /tmp/vultr-reinstall-response.json
+          rm -f /tmp/vultr-reboot-response.json
 
       - name: Verify public gateway
         shell: bash
@@ -142,25 +133,13 @@ jobs:
           set -euo pipefail
           for attempt in $(seq 1 120); do
             response=$(curl --max-time 5 --silent --show-error \
-              --header 'Accept: application/nostr+json' \
-              https://relay.drum.dev/ 2>/dev/null || true)
-            if jq -e \
-              '((.supported_nips // []) | index(42)) != null and .limitation.restricted_writes == true' \
-              >/dev/null 2>&1 <<<"$response"; then
+              --header 'Cache-Control: no-cache' \
+              "https://relay.drum.dev/health?expected=$GITHUB_SHA" 2>/dev/null || true)
+            if jq -e --arg expected "$GITHUB_SHA" \
+              '.status == "ok" and .build == $expected' >/dev/null 2>&1 <<<"$response"; then
               exit 0
             fi
             sleep 5
           done
           echo 'Gateway did not become healthy' >&2
           exit 1
-
-      - name: Clear one-time user data
-        if: always()
-        run: |
-          printf '%s' '{"user_data":""}' |
-            curl --fail --silent --show-error --retry 5 --retry-all-errors \
-              --request PATCH \
-              "https://api.vultr.com/v2/instances/$VULTR_GATEWAY_ID" \
-              --header "Authorization: Bearer $VULTR_API_KEY" \
-              --header 'Content-Type: application/json' \
-              --data-binary @-

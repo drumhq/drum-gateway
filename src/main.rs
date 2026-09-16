@@ -22,6 +22,10 @@ const RELAY_SERVICE: &str = "shared-relay";
 const BLOSSOM_SERVICE: &str = "shared-blossom";
 const NIP42_KIND: u16 = 22_242;
 const BLOSSOM_AUTH_KIND: u16 = 24_242;
+const BUILD_SHA: &str = match option_env!("DRUM_GATEWAY_BUILD_SHA") {
+    Some(value) => value,
+    None => "development",
+};
 
 #[derive(Clone)]
 struct GatewayState {
@@ -60,7 +64,7 @@ impl GatewayConfig {
             relay_upstream_ws: required_env("RELAY_UPSTREAM_WS")?,
             relay_upstream_http: required_env("RELAY_UPSTREAM_HTTP")?,
             blossom_hostname: env::var("BLOSSOM_HOSTNAME")
-                .unwrap_or_else(|_| "blossom.drum.dev".to_string()),
+                .unwrap_or_else(|_| "media.drum.dev".to_string()),
             blossom_upstream_http: required_env("BLOSSOM_UPSTREAM_HTTP")?,
             blossom_max_write_bytes: positive_i64_env("BLOSSOM_MAX_WRITE_BYTES", "95000000")?,
         })
@@ -339,13 +343,20 @@ async fn main() -> Result<()> {
             .build()?,
     };
     let app = Router::new()
-        .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
+        .route("/health", get(health))
         .fallback(route_request)
         .with_state(state);
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "Nostr gateway listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn health() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "status": "ok", "build": BUILD_SHA })),
+    )
 }
 
 async fn route_request(State(state): State<GatewayState>, request: Request) -> Response {
@@ -1258,7 +1269,7 @@ mod tests {
             sha256: "d".repeat(64),
             size: 42,
             mime_type: "image/webp".to_string(),
-            url: format!("https://blossom.drum.dev/{}.webp", "d".repeat(64)),
+            url: format!("https://media.drum.dev/{}.webp", "d".repeat(64)),
             uploaded: 1_700_000_000,
         };
         assert!(valid_blob_descriptor(&descriptor));

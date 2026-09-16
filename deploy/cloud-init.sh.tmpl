@@ -2,12 +2,25 @@
 set -eu
 
 bootstrap_stage=initialization
+clear_cached_user_data() {
+  if [ -d /var/lib/cloud/instances ]; then
+    find /var/lib/cloud/instances -type f \( \
+      -name 'user-data.txt' -o \
+      -name 'user-data.txt.i' -o \
+      -path '*/scripts/part-*' \
+    \) -delete 2>/dev/null || true
+  fi
+}
+
 publish_bootstrap_error() {
   status=$?
+  clear_cached_user_data
   [ "$status" -eq 0 ] && return
   install -d -m 0755 /var/lib/drum-diagnostics
   printf '{"status":"failed","stage":"%s","exit_code":%s}\n' \
     "$bootstrap_stage" "$status" > /var/lib/drum-diagnostics/status.json
+  trap - EXIT
+  exit "$status"
 }
 trap publish_bootstrap_error EXIT
 
@@ -26,6 +39,13 @@ printf '%s  %s\n' "$expected_sha256" /tmp/drum-gateway | sha256sum --check --sta
 install -m 0755 -o root -g root /tmp/drum-gateway /usr/local/bin/drum-gateway
 rm -f /tmp/drum-gateway
 
+bootstrap_stage=updater_install
+curl --fail --location --retry 10 --retry-all-errors \
+  --output /tmp/install-gateway-updater.sh \
+  https://raw.githubusercontent.com/drumhq/drum-gateway/main/deploy/install-updater.sh
+sh /tmp/install-gateway-updater.sh
+rm -f /tmp/install-gateway-updater.sh
+
 bootstrap_stage=configuration
 install -d -m 0750 /etc/drum
 {
@@ -38,7 +58,7 @@ install -d -m 0750 /etc/drum
   printf 'RELAY_PUBLIC_URL=wss://relay.drum.dev/\n'
   printf 'RELAY_UPSTREAM_WS=ws://__RELAY_PRIVATE_IPV4__:8080\n'
   printf 'RELAY_UPSTREAM_HTTP=http://__RELAY_PRIVATE_IPV4__:8080\n'
-  printf 'BLOSSOM_HOSTNAME=blossom.drum.dev\n'
+  printf 'BLOSSOM_HOSTNAME=media.drum.dev\n'
   printf 'BLOSSOM_UPSTREAM_HTTP=http://__BLOSSOM_PRIVATE_IPV4__:3000\n'
   printf 'RUST_LOG=drum_gateway=info\n'
 } > /etc/drum/gateway.env
@@ -84,8 +104,16 @@ systemctl daemon-reload
 systemctl enable --now drum-gateway
 
 bootstrap_stage=caddy_configuration
+install -d -m 0750 -o root -g caddy /etc/caddy/tls
+printf '%s' '__CLOUDFLARE_ORIGIN_CERT_B64__' | base64 -d > /etc/caddy/tls/drum-origin.pem
+printf '%s' '__CLOUDFLARE_ORIGIN_KEY_B64__' | base64 -d > /etc/caddy/tls/drum-origin-key.pem
+chown root:caddy /etc/caddy/tls/drum-origin.pem /etc/caddy/tls/drum-origin-key.pem
+chmod 0644 /etc/caddy/tls/drum-origin.pem
+chmod 0640 /etc/caddy/tls/drum-origin-key.pem
+
 cat > /etc/caddy/Caddyfile <<'EOF'
-relay.drum.dev, blossom.drum.dev {
+relay.drum.dev, media.drum.dev {
+  tls /etc/caddy/tls/drum-origin.pem /etc/caddy/tls/drum-origin-key.pem
   reverse_proxy 127.0.0.1:3100
 }
 EOF
@@ -111,5 +139,5 @@ test -f /var/lib/drum-bootstrap-complete
 bootstrap_stage=edge_start
 systemctl enable --now caddy
 
-find /var/lib/cloud/instances -type f \( -name 'user-data.txt' -o -name 'user-data.txt.i' -o -path '*/scripts/part-*' \) -delete
+clear_cached_user_data
 trap - EXIT

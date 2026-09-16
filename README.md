@@ -43,21 +43,33 @@ cargo test
 
 ## Shared gateway deployment
 
-Pushes to `main` run `.github/workflows/deploy-shared.yml`. The workflow tests
-the gateway and builds the release binary inside Debian Bookworm, matching the
-gateway operating system. It publishes the binary as a public, immutable,
-commit-specific GitHub prerelease, verifies the SHA-256 checksum on the VM, and
-installs the gateway as a hardened systemd service. Vultr user-data is removed
-after the deployment attempt.
+`.github/workflows/deploy-shared.yml` tests the gateway and builds the release
+binary inside Debian Bookworm, matching the gateway operating system. It
+publishes both a public, immutable,
+commit-specific prerelease and checksum-verified stable deployment assets, then
+reboots the existing Vultr VM. A one-shot systemd updater installs the stable
+asset during boot before the gateway starts.
+
+Deployments do not reinstall the VM. Caddy, `/var/lib/caddy`, certificates,
+gateway configuration, and the operating system remain intact. The updater
+runs only during boot and does not poll GitHub.
 
 Configure these repository Actions secrets:
 
 - `VULTR_API_KEY`: the deployment API key.
-- `GATEWAY_SHARED_SECRET`: the Drum API machine-to-machine secret.
 
-Configure one repository Actions variable:
+The normal deployment workflow does not need `GATEWAY_SHARED_SECRET` or
+`DRUM_API_ORIGIN`; they remain in the VM's protected gateway environment file.
+The VM downloads public release assets and receives no GitHub credentials.
 
-- `DRUM_API_ORIGIN`: the Drum API used for authorization and accounting.
+The one-time `Recover shared gateway` workflow rebuilds an existing VM with a
+static Cloudflare Origin CA certificate. It requires the existing recovery
+values plus the `CLOUDFLARE_ORIGIN_CERT` and `CLOUDFLARE_ORIGIN_KEY` repository
+secrets, and only runs when manually dispatched with `REBUILD`. Its recovery
+user-data is cleared after every attempt. Normal deployments never read these
+certificate secrets or modify Caddy.
 
-The gateway receives the shared API secret and a public, commit-specific binary
-URL. It does not receive GitHub credentials.
+For an existing VM created before the updater was introduced, push these
+changes and run `Recover shared gateway` once. The normal deployment workflow
+is manual-only during this migration so pushing the recovery code cannot reboot
+or reinstall the VM. Automatic push deployments can be enabled after recovery.
