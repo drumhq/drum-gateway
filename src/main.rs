@@ -472,31 +472,45 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
                             authenticated_pubkey.is_some(),
                         ) {
                             let _ = client_socket.send(Message::Text(
-                                auth_required_response(command, value.as_ref())
-                                    .to_string()
-                                    .into(),
+                                auth_required_response().to_string().into(),
                             )).await;
                             continue;
                         }
 
                         if command == Some("EVENT") {
-                            let Some(authenticated) = authenticated_pubkey.as_deref() else {
-                                continue;
-                            };
                             let event_value = value.as_ref()
                                 .and_then(Value::as_array)
                                 .and_then(|items| items.get(1));
-                            let event = event_value.and_then(|value| serde_json::from_value::<Event>(value.clone()).ok());
-                            let valid = event.as_ref().is_some_and(|event| {
-                                event.verify().is_ok() && event.pubkey.to_hex() == authenticated
-                            });
-                            let event_id = event.as_ref().map(|event| event.id.to_hex()).unwrap_or_default();
-                            if !valid || !state.authorize(RELAY_SERVICE, "write", Some(authenticated)).await.authorized {
+                            let event_id = event_value
+                                .and_then(|event| event.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if event_value.is_some_and(is_protected_event)
+                                && authenticated_pubkey.is_none()
+                            {
+                                let _ = send_relay_ok(
+                                    &mut client_socket,
+                                    event_id,
+                                    false,
+                                    "auth-required: protected events require NIP-42",
+                                )
+                                .await;
+                                continue;
+                            }
+                            let Some(event) = event_value.and_then(|value| {
+                                verify_relay_event(value, authenticated_pubkey.as_deref()).ok()
+                            }) else {
+                                let _ = send_relay_ok(&mut client_socket, event_id, false, "invalid: event signature or author").await;
+                                continue;
+                            };
+                            let event_id = event.id.to_hex();
+                            let event_pubkey = event.pubkey.to_hex();
+                            if !state.authorize(RELAY_SERVICE, "write", Some(&event_pubkey)).await.authorized {
                                 let _ = send_relay_ok(&mut client_socket, &event_id, false, "restricted: event author is not approved").await;
                                 continue;
                             }
-                            if event.as_ref().is_some_and(|event| event.kind.as_u16() == 1) {
-                                match state.record_note_publication(authenticated, &event_id).await {
+                            if event.kind.as_u16() == 1 {
+                                match state.record_note_publication(&event_pubkey, &event_id).await {
                                     Ok(()) => {}
                                     Err(NotePublicationError::LimitReached) => {
                                         let _ = send_relay_ok(&mut client_socket, &event_id, false, "rate-limited: publishing temporarily unavailable").await;
@@ -567,7 +581,7 @@ fn verify_relay_auth(value: &Value, challenge: &str, relay_url: &str) -> Result<
         .get("tags")
         .and_then(Value::as_array)
         .context("missing tags")?;
-    if !has_json_tag(tags, "challenge", challenge) || !has_json_tag(tags, "relay", relay_url) {
+    if !has_json_tag(tags, "challenge", challenge) || !has_relay_tag(tags, relay_url) {
         anyhow::bail!("NIP-42 event is not bound to this session");
     }
     let now = nostr::Timestamp::now().as_secs();
@@ -587,35 +601,58 @@ fn has_json_tag(tags: &[Value], name: &str, expected: &str) -> bool {
     })
 }
 
+fn has_relay_tag(tags: &[Value], expected: &str) -> bool {
+    tags.iter().any(|tag| {
+        tag.as_array().is_some_and(|items| {
+            items.first().and_then(Value::as_str) == Some("relay")
+                && items
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .is_some_and(|relay| relay_urls_match(relay, expected))
+        })
+    })
+}
+
+fn relay_urls_match(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+fn is_protected_event(value: &Value) -> bool {
+    value
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag.as_array().is_some_and(|items| {
+                    items.len() == 1 && items.first().and_then(Value::as_str) == Some("-")
+                })
+            })
+        })
+}
+
+fn verify_relay_event(value: &Value, authenticated_pubkey: Option<&str>) -> Result<Event> {
+    let event: Event = serde_json::from_value(value.clone())?;
+    event.verify()?;
+    if authenticated_pubkey.is_some_and(|pubkey| pubkey != event.pubkey.to_hex()) {
+        anyhow::bail!("event author does not match the authenticated public key");
+    }
+    Ok(event)
+}
+
 fn can_attempt_relay_command(
     command: Option<&str>,
     public_read: bool,
     authenticated: bool,
 ) -> bool {
     if command == Some("EVENT") {
-        authenticated
+        true
     } else {
         public_read || authenticated
     }
 }
 
-fn auth_required_response(command: Option<&str>, value: Option<&Value>) -> Value {
-    if command == Some("EVENT") {
-        let event_id = value
-            .and_then(Value::as_array)
-            .and_then(|items| items.get(1))
-            .and_then(|event| event.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        json!([
-            "OK",
-            event_id,
-            false,
-            "auth-required: authenticate with NIP-42"
-        ])
-    } else {
-        json!(["NOTICE", "auth-required: authenticate with NIP-42"])
-    }
+fn auth_required_response() -> Value {
+    json!(["NOTICE", "auth-required: authenticate with NIP-42"])
 }
 
 async fn blossom_request(state: GatewayState, request: Request) -> Response {
@@ -1072,7 +1109,7 @@ mod tests {
     #[test]
     fn verifies_bound_nip42_event() {
         let challenge = "challenge";
-        let relay = "wss://relay.drum.dev/";
+        let relay = "wss://relay.drum.dev";
         let event = EventBuilder::new(Kind::Authentication, "")
             .tags([
                 Tag::parse(["relay", relay]).unwrap(),
@@ -1082,33 +1119,61 @@ mod tests {
             .unwrap();
         let value = serde_json::to_value(event).unwrap();
 
-        assert!(verify_relay_auth(&value, challenge, relay).is_ok());
-        assert!(verify_relay_auth(&value, "another", relay).is_err());
+        assert!(verify_relay_auth(&value, challenge, "wss://relay.drum.dev/").is_ok());
+        assert!(verify_relay_auth(&value, "another", "wss://relay.drum.dev/").is_err());
+        assert!(verify_relay_auth(&value, challenge, "wss://another-relay.example/").is_err());
     }
 
     #[test]
-    fn public_clients_can_read_but_cannot_publish() {
+    fn signed_events_can_attempt_publish_without_nip42() {
         assert!(can_attempt_relay_command(Some("REQ"), true, false));
         assert!(can_attempt_relay_command(Some("CLOSE"), true, false));
-        assert!(!can_attempt_relay_command(Some("EVENT"), true, false));
+        assert!(can_attempt_relay_command(Some("EVENT"), true, false));
         assert!(can_attempt_relay_command(Some("EVENT"), true, true));
         assert!(!can_attempt_relay_command(Some("REQ"), false, false));
     }
 
     #[test]
-    fn unauthenticated_event_gets_nip42_ok_rejection() {
-        let event_id = "a".repeat(64);
-        let message = json!(["EVENT", { "id": event_id }]);
+    fn verifies_signed_event_without_nip42() {
+        let event = EventBuilder::new(Kind::TextNote, "hello")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let value = serde_json::to_value(event).unwrap();
 
-        assert_eq!(
-            auth_required_response(Some("EVENT"), Some(&message)),
-            json!([
-                "OK",
-                event_id,
-                false,
-                "auth-required: authenticate with NIP-42"
-            ])
-        );
+        assert!(verify_relay_event(&value, None).is_ok());
+    }
+
+    #[test]
+    fn rejects_tampered_event_without_nip42() {
+        let event = EventBuilder::new(Kind::TextNote, "hello")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut value = serde_json::to_value(event).unwrap();
+        value["content"] = json!("tampered");
+
+        assert!(verify_relay_event(&value, None).is_err());
+    }
+
+    #[test]
+    fn identifies_nip70_protected_events() {
+        assert!(is_protected_event(&json!({ "tags": [["-"]] })));
+        assert!(!is_protected_event(&json!({ "tags": [] })));
+        assert!(!is_protected_event(
+            &json!({ "tags": [["-", "unexpected"]] })
+        ));
+    }
+
+    #[test]
+    fn authenticated_event_author_must_match_session() {
+        let author = Keys::generate();
+        let another_author = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "hello")
+            .sign_with_keys(&author)
+            .unwrap();
+        let value = serde_json::to_value(event).unwrap();
+
+        assert!(verify_relay_event(&value, Some(&author.public_key().to_hex())).is_ok());
+        assert!(verify_relay_event(&value, Some(&another_author.public_key().to_hex())).is_err());
     }
 
     #[test]

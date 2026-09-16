@@ -7,9 +7,13 @@ and proxies approved traffic to private Vultr VPC origins.
 
 ## Enforcement
 
-- Relay subscriptions are public; NIP-42 authentication is required before publishing.
-- Relay events must be valid, authored by the authenticated key, and have an
-  active `shared-relay` write grant.
+- Relay subscriptions are public. Clients may publish signed events directly
+  or authenticate first with NIP-42.
+- Relay events must have a valid signature and an active `shared-relay` write
+  grant for the event author's public key. For NIP-42 sessions, the
+  authenticated key must also match the event author.
+- NIP-70 protected events still require NIP-42 authentication so they cannot
+  be replayed by a third party.
 - Blossom uploads, mirrors, and deletes require a valid kind `24242`
   authorization event and an active `shared-blossom` write grant.
 - Blossom uploads and mirrors reserve account storage before reaching the
