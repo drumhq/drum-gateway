@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{FromRequestParts, Request, State, WebSocketUpgrade, ws::Message},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -691,6 +691,9 @@ fn auth_required_response() -> Value {
 async fn blossom_request(state: GatewayState, request: Request) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    if method == Method::OPTIONS {
+        return proxy_http(request, &state.config.blossom_upstream_http, &state.client).await;
+    }
     let is_upload = method == Method::PUT && path == "/upload";
     let is_upload_preflight = method == Method::HEAD && path == "/upload";
     let is_mirror = method == Method::PUT && path == "/mirror";
@@ -841,6 +844,15 @@ async fn blossom_request(state: GatewayState, request: Request) -> Response {
             }
         };
         if !buffered.status.is_success() {
+            tracing::warn!(
+                status = %buffered.status,
+                reason = buffered
+                    .headers
+                    .get("x-reason")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("unknown"),
+                "Blossom upstream rejected upload"
+            );
             state
                 .cancel_blossom_reservation(&reservation.reservation_id)
                 .await;
@@ -1155,10 +1167,27 @@ async fn send_http(
             && name != header::HOST
             && (forwards_body || name != header::CONTENT_LENGTH)
         {
+            if name == header::AUTHORIZATION
+                && let Some(normalized) = normalized_nostr_authorization(value)
+            {
+                builder = builder.header(name, normalized);
+                continue;
+            }
             builder = builder.header(name, value);
         }
     }
     builder.send().await
+}
+
+fn normalized_nostr_authorization(value: &HeaderValue) -> Option<HeaderValue> {
+    let value = value.to_str().ok()?;
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("nostr") || parts.next().is_some() {
+        return None;
+    }
+    HeaderValue::from_str(&format!("Nostr {token}")).ok()
 }
 
 fn method_forwards_body(method: &Method) -> bool {
@@ -1387,6 +1416,21 @@ mod tests {
         assert!(method_forwards_body(&Method::POST));
         assert!(method_forwards_body(&Method::PUT));
         assert!(method_forwards_body(&Method::DELETE));
+    }
+
+    #[test]
+    fn normalizes_nostr_authorization_scheme_for_upstream_compatibility() {
+        let lowercase = HeaderValue::from_static("nostr token");
+        let normalized = normalized_nostr_authorization(&lowercase).unwrap();
+        assert_eq!(normalized, "Nostr token");
+
+        let standard = HeaderValue::from_static("Nostr token");
+        let normalized = normalized_nostr_authorization(&standard).unwrap();
+        assert_eq!(normalized, "Nostr token");
+
+        assert!(
+            normalized_nostr_authorization(&HeaderValue::from_static("Bearer token")).is_none()
+        );
     }
 
     #[test]
