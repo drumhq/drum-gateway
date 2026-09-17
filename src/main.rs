@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{FromRequestParts, Request, State, WebSocketUpgrade, ws::Message},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -17,7 +17,7 @@ use rand::RngCore;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite};
 
@@ -94,6 +94,14 @@ struct AuthorizationResponse {
 struct RecordNotePublicationRequest<'a> {
     public_key: &'a str,
     event_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteNotePublicationRequest<'a> {
+    public_key: &'a str,
+    event_id: &'a str,
+    accepted: bool,
 }
 
 enum NotePublicationError {
@@ -223,6 +231,30 @@ impl GatewayState {
         if !response.status().is_success() {
             return Err(NotePublicationError::Unavailable);
         }
+        Ok(())
+    }
+
+    async fn complete_note_publication(
+        &self,
+        public_key: &str,
+        event_id: &str,
+        accepted: bool,
+    ) -> Result<()> {
+        self.client
+            .post(format!(
+                "{}/v1/internal/nostr/note-publications/complete",
+                self.config.api_origin
+            ))
+            .bearer_auth(&self.config.shared_secret)
+            .json(&CompleteNotePublicationRequest {
+                public_key,
+                event_id,
+                accepted,
+            })
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -469,6 +501,7 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
         .await
         .authorized;
     let mut authenticated_pubkey: Option<String> = None;
+    let mut pending_note_publications = HashMap::<String, String>::new();
     loop {
         tokio::select! {
             incoming = client_socket.recv() => {
@@ -544,7 +577,12 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
                             }
                             if event.kind.as_u16() == 1 {
                                 match state.record_note_publication(&event_pubkey, &event_id).await {
-                                    Ok(()) => {}
+                                    Ok(()) => {
+                                        pending_note_publications.insert(
+                                            event_id.clone(),
+                                            event_pubkey,
+                                        );
+                                    }
                                     Err(NotePublicationError::LimitReached) => {
                                         let _ = send_relay_ok(&mut client_socket, &event_id, false, "rate-limited: publishing temporarily unavailable").await;
                                         continue;
@@ -575,6 +613,25 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
             }
             incoming = upstream_rx.next() => {
                 let Some(Ok(message)) = incoming else { break };
+                if let tungstenite::Message::Text(text) = &message
+                    && let Some((event_id, accepted)) = relay_ok_response(text)
+                    && let Some(public_key) = pending_note_publications.remove(&event_id)
+                {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = state
+                            .complete_note_publication(&public_key, &event_id, accepted)
+                            .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                %event_id,
+                                accepted,
+                                "failed to complete note publication"
+                            );
+                        }
+                    });
+                }
                 let outgoing = match message {
                     tungstenite::Message::Text(text) => Message::Text(text.to_string().into()),
                     tungstenite::Message::Binary(bytes) => Message::Binary(bytes),
@@ -587,6 +644,18 @@ async fn relay_session(mut client_socket: axum::extract::ws::WebSocket, state: G
             }
         }
     }
+}
+
+fn relay_ok_response(text: &str) -> Option<(String, bool)> {
+    let message = serde_json::from_str::<Value>(text).ok()?;
+    let parts = message.as_array()?;
+    if parts.first().and_then(Value::as_str) != Some("OK") {
+        return None;
+    }
+    Some((
+        parts.get(1)?.as_str()?.to_string(),
+        parts.get(2)?.as_bool()?,
+    ))
 }
 
 async fn send_relay_ok(
@@ -691,6 +760,9 @@ fn auth_required_response() -> Value {
 async fn blossom_request(state: GatewayState, request: Request) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    if method == Method::OPTIONS {
+        return proxy_http(request, &state.config.blossom_upstream_http, &state.client).await;
+    }
     let is_upload = method == Method::PUT && path == "/upload";
     let is_upload_preflight = method == Method::HEAD && path == "/upload";
     let is_mirror = method == Method::PUT && path == "/mirror";
@@ -841,6 +913,15 @@ async fn blossom_request(state: GatewayState, request: Request) -> Response {
             }
         };
         if !buffered.status.is_success() {
+            tracing::warn!(
+                status = %buffered.status,
+                reason = buffered
+                    .headers
+                    .get("x-reason")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("unknown"),
+                "Blossom upstream rejected upload"
+            );
             state
                 .cancel_blossom_reservation(&reservation.reservation_id)
                 .await;
@@ -1155,10 +1236,27 @@ async fn send_http(
             && name != header::HOST
             && (forwards_body || name != header::CONTENT_LENGTH)
         {
+            if name == header::AUTHORIZATION
+                && let Some(normalized) = normalized_nostr_authorization(value)
+            {
+                builder = builder.header(name, normalized);
+                continue;
+            }
             builder = builder.header(name, value);
         }
     }
     builder.send().await
+}
+
+fn normalized_nostr_authorization(value: &HeaderValue) -> Option<HeaderValue> {
+    let value = value.to_str().ok()?;
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("nostr") || parts.next().is_some() {
+        return None;
+    }
+    HeaderValue::from_str(&format!("Nostr {token}")).ok()
 }
 
 fn method_forwards_body(method: &Method) -> bool {
@@ -1303,6 +1401,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_relay_note_completion_responses() {
+        assert_eq!(
+            relay_ok_response(r#"["OK","event-id",true,""]"#),
+            Some(("event-id".to_string(), true))
+        );
+        assert_eq!(
+            relay_ok_response(r#"["OK","event-id",false,"blocked"]"#),
+            Some(("event-id".to_string(), false))
+        );
+        assert_eq!(relay_ok_response(r#"["EVENT","sub",{}]"#), None);
+    }
+
+    #[test]
     fn verifies_signed_event_without_nip42() {
         let event = EventBuilder::new(Kind::TextNote, "hello")
             .sign_with_keys(&Keys::generate())
@@ -1387,6 +1498,21 @@ mod tests {
         assert!(method_forwards_body(&Method::POST));
         assert!(method_forwards_body(&Method::PUT));
         assert!(method_forwards_body(&Method::DELETE));
+    }
+
+    #[test]
+    fn normalizes_nostr_authorization_scheme_for_upstream_compatibility() {
+        let lowercase = HeaderValue::from_static("nostr token");
+        let normalized = normalized_nostr_authorization(&lowercase).unwrap();
+        assert_eq!(normalized, "Nostr token");
+
+        let standard = HeaderValue::from_static("Nostr token");
+        let normalized = normalized_nostr_authorization(&standard).unwrap();
+        assert_eq!(normalized, "Nostr token");
+
+        assert!(
+            normalized_nostr_authorization(&HeaderValue::from_static("Bearer token")).is_none()
+        );
     }
 
     #[test]
